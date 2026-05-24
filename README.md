@@ -58,6 +58,11 @@ npm run dev
 
 Open http://localhost:5173.
 
+## Screenshot
+
+<img width="1401" height="748" alt="image" src="https://github.com/user-attachments/assets/dbf3522d-d744-4401-a31a-5d7ad82ed6f8" />
+
+
 ## Layout
 - `server/src/gemini.ts` — Managed Agents wrapper (`runInteraction`), event stream consumer, Zod re-parse
 - `server/src/agents.ts` — pipeline graph: IntentParser → Researcher → VideoIngest → Compositor → Validator → VideoScout · MomentMiner
