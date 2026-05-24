@@ -5,6 +5,7 @@ export type LiveEvent =
   | { kind: "close"; reason?: string }
   | { kind: "transcript"; role: "user" | "model"; text: string }
   | { kind: "toolCall"; id: string; name: string; args: unknown }
+  | { kind: "info"; text: string }
   | { kind: "error"; message: string };
 
 export interface LiveOptions {
@@ -16,16 +17,21 @@ export class LiveSession {
   private ws: WebSocket | null = null;
   private player = new PcmPlayer(24000);
   private opts: LiveOptions;
+  private opened = false;
   constructor(opts: LiveOptions) {
     this.opts = opts;
   }
 
+  isOpen() {
+    return this.opened;
+  }
+
   connect() {
+    this.player.resume();
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/live`);
     this.ws = ws;
     ws.onopen = () => {
-      this.player.resume();
       const setup = {
         setup: {
           model: "models/gemini-3.5-flash",
@@ -38,38 +44,76 @@ export class LiveSession {
         },
       };
       ws.send(JSON.stringify(setup));
-      this.opts.onEvent({ kind: "open" });
     };
     ws.onmessage = (ev) => this.handleMessage(ev.data);
-    ws.onclose = (ev) =>
-      this.opts.onEvent({ kind: "close", reason: ev.reason });
-    ws.onerror = () =>
+    ws.onclose = (ev) => {
+      this.opened = false;
+      this.opts.onEvent({
+        kind: "close",
+        reason: ev.reason || `code ${ev.code}`,
+      });
+    };
+    ws.onerror = () => {
       this.opts.onEvent({ kind: "error", message: "WebSocket error" });
+    };
   }
 
   private handleMessage(raw: unknown) {
     let data: Record<string, unknown>;
     try {
-      data = typeof raw === "string" ? JSON.parse(raw) : JSON.parse(String(raw));
+      data =
+        typeof raw === "string" ? JSON.parse(raw) : JSON.parse(String(raw));
     } catch {
       return;
     }
+    if (data.setupComplete && !this.opened) {
+      this.opened = true;
+      this.opts.onEvent({ kind: "open" });
+      this.opts.onEvent({ kind: "info", text: "Live session ready" });
+    }
+    const upstreamErr = data.upstreamError as { message?: string } | undefined;
+    if (upstreamErr?.message) {
+      this.opts.onEvent({
+        kind: "error",
+        message: `upstream: ${upstreamErr.message}`,
+      });
+    }
+    const upstreamClose = data.upstreamClose as
+      | { code?: number; reason?: string }
+      | undefined;
+    if (upstreamClose) {
+      this.opts.onEvent({
+        kind: "info",
+        text: `upstream closed ${upstreamClose.code ?? ""} ${upstreamClose.reason ?? ""}`,
+      });
+    }
     const sc = data.serverContent as
       | {
-          modelTurn?: { parts?: Array<{ inlineData?: { data?: string; mimeType?: string } }> };
+          modelTurn?: {
+            parts?: Array<{
+              inlineData?: { data?: string; mimeType?: string };
+            }>;
+          };
           inputTranscription?: { text?: string };
           outputTranscription?: { text?: string };
+          interrupted?: boolean;
         }
       | undefined;
+    if (sc?.interrupted) this.player.stop();
     if (sc?.modelTurn?.parts) {
       for (const p of sc.modelTurn.parts) {
         const inline = p.inlineData;
-        if (inline?.data && inline.mimeType?.startsWith("audio/pcm")) {
+        if (
+          inline?.data &&
+          (inline.mimeType?.startsWith("audio/pcm") ||
+            inline.mimeType?.startsWith("audio/L16") ||
+            inline.mimeType?.startsWith("audio/wav"))
+        ) {
           const bytes = bytesFromBase64(inline.data);
           const pcm = new Int16Array(
             bytes.buffer,
             bytes.byteOffset,
-            bytes.byteLength / 2,
+            Math.floor(bytes.byteLength / 2),
           );
           this.player.play(pcm);
         }
@@ -106,32 +150,32 @@ export class LiveSession {
   }
 
   sendAudio(pcm: Int16Array) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (!this.opened || this.ws?.readyState !== WebSocket.OPEN) return;
     const b64 = base64FromBytes(
       new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength),
     );
     this.ws.send(
       JSON.stringify({
         realtimeInput: {
-          mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: b64 }],
+          audio: { mimeType: "audio/pcm;rate=16000", data: b64 },
         },
       }),
     );
   }
 
   sendImage(jpegB64: string) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (!this.opened || this.ws?.readyState !== WebSocket.OPEN) return;
     this.ws.send(
       JSON.stringify({
         realtimeInput: {
-          mediaChunks: [{ mimeType: "image/jpeg", data: jpegB64 }],
+          video: { mimeType: "image/jpeg", data: jpegB64 },
         },
       }),
     );
   }
 
   sendText(text: string) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    if (!this.opened || this.ws?.readyState !== WebSocket.OPEN) return;
     this.ws.send(JSON.stringify({ realtimeInput: { text } }));
   }
 
@@ -145,6 +189,7 @@ export class LiveSession {
   }
 
   close() {
+    this.opened = false;
     this.player.stop();
     this.ws?.close();
     this.ws = null;

@@ -2,6 +2,7 @@ export type AgentStage =
   | "intent"
   | "researcher"
   | "youtube"
+  | "videos"
   | "validator"
   | "compositor"
   | "done"
@@ -10,6 +11,9 @@ export type AgentStage =
 export interface AgentEvent {
   ts: number;
   stage: AgentStage;
+  agent?: string;
+  model?: string;
+  query?: string;
   status: "start" | "thinking" | "result" | "error";
   message: string;
   data?: unknown;
@@ -33,7 +37,24 @@ export interface DrillStep {
   cue: string;
   reps: number;
   durationSec: number;
-  focusLandmark?: string;
+  focusLandmark?: string | null;
+}
+
+export interface DrillMoment {
+  t: number;
+  caption: string;
+  thumb: string;
+}
+
+export interface DrillVideo {
+  stepIndex: number;
+  query: string;
+  videoId: string;
+  url: string;
+  title?: string;
+  thumb: string;
+  start?: number;
+  moments?: DrillMoment[];
 }
 
 export interface Routine {
@@ -42,7 +63,7 @@ export interface Routine {
   estimateMinutes: number;
   steps: DrillStep[];
   cues: string[];
-  source?: { url?: string; note?: string };
+  source?: { url?: string | null; note?: string | null } | null;
 }
 
 export interface ValidatorDiff {
@@ -57,6 +78,7 @@ export interface CompileResult {
   routine: Routine;
   validated: Routine;
   diffs: ValidatorDiff[];
+  videos: DrillVideo[];
   youtubeUrl?: string;
   sources: string[];
 }

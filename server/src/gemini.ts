@@ -58,3 +58,28 @@ export async function analyzeYouTube(url: string, prompt: string) {
   });
   return res.text ?? "";
 }
+
+export async function analyzeYouTubeJSON<S extends ZodType>(
+  url: string,
+  prompt: string,
+  schema: S,
+): Promise<z.infer<S>> {
+  const json = zodToJsonSchema(schema, { target: "openAi" });
+  const res = await ai.models.generateContent({
+    model: MODEL,
+    contents: [
+      {
+        role: "user",
+        parts: [
+          { fileData: { fileUri: url, mimeType: "video/mp4" } },
+          { text: prompt },
+        ],
+      },
+    ] as never,
+    config: {
+      responseMimeType: "application/json",
+      responseJsonSchema: json,
+    },
+  });
+  return schema.parse(JSON.parse(res.text ?? "{}"));
+}
