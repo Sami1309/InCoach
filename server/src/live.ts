@@ -1,10 +1,7 @@
 import { WebSocketServer, WebSocket, type RawData } from "ws";
 import type { Server } from "node:http";
-
-const GEMINI_WS = (key: string) =>
-  `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(
-    key,
-  )}`;
+import { Modality, type LiveServerMessage, type Session } from "@google/genai";
+import { ai, LIVE_MODEL } from "./gemini.js";
 
 function rawToString(data: RawData, isBinary: boolean): string {
   if (isBinary) return Buffer.from(data as Buffer).toString("utf-8");
@@ -16,59 +13,179 @@ function rawToString(data: RawData, isBinary: boolean): string {
 
 export function attachLiveProxy(server: Server) {
   const wss = new WebSocketServer({ server, path: "/live" });
-  wss.on("connection", (client) => {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) {
+
+  wss.on("connection", async (client) => {
+    if (!process.env.GEMINI_API_KEY) {
       client.close(1011, "GEMINI_API_KEY missing on server");
       return;
     }
-    console.log("[live] client connected, opening upstream");
-    const upstream = new WebSocket(GEMINI_WS(key));
-    const queue: string[] = [];
-    let upstreamOpen = false;
+    console.log("[live] client connected");
 
-    upstream.on("open", () => {
-      upstreamOpen = true;
-      console.log("[live] upstream open");
-      for (const m of queue) upstream.send(m);
+    let session: Session | null = null;
+    let ready = false;
+    const queue: Array<Record<string, unknown>> = [];
+
+    const sendToClient = (obj: unknown) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(JSON.stringify(obj));
+      }
+    };
+
+    const drain = () => {
+      if (!session) return;
+      for (const m of queue) routeClientMessage(session, m);
       queue.length = 0;
-    });
+    };
 
-    upstream.on("message", (data, isBinary) => {
-      if (client.readyState !== WebSocket.OPEN) return;
-      const text = rawToString(data, isBinary);
-      client.send(text);
-    });
-    upstream.on("close", (code, reason) => {
-      const r = reason?.toString() ?? "";
-      console.log(`[live] upstream closed ${code} ${r}`);
-      if (client.readyState === WebSocket.OPEN) {
-        if (r) client.send(JSON.stringify({ upstreamClose: { code, reason: r } }));
-        client.close(code === 1000 ? 1000 : 1011, r || `upstream ${code}`);
+    const handleServerMessage = (m: LiveServerMessage) => {
+      try {
+        sendToClient(m);
+      } catch (err) {
+        console.error("[live] forward error", err);
       }
-    });
-    upstream.on("error", (err) => {
-      console.error("[live] upstream error", err.message);
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({ upstreamError: { message: err.message } }));
-        client.close(1011, err.message);
-      }
-    });
+    };
+
+    try {
+      session = await ai.live.connect({
+        model: LIVE_MODEL,
+        config: {
+          responseModalities: [Modality.AUDIO],
+          systemInstruction: {
+            parts: [
+              {
+                text: "You are an encouraging, concise live coach. Reply in one breath. Wait for the client to set context.",
+              },
+            ],
+          },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
+        },
+        callbacks: {
+          onopen: () => {
+            console.log("[live] upstream open");
+            ready = true;
+            sendToClient({ setupComplete: {} });
+            drain();
+          },
+          onmessage: handleServerMessage,
+          onerror: (e) => {
+            const msg =
+              (e as { message?: string } | undefined)?.message ?? "upstream error";
+            console.error("[live] upstream error", msg);
+            sendToClient({ upstreamError: { message: msg } });
+          },
+          onclose: (e) => {
+            const reason =
+              (e as { reason?: string } | undefined)?.reason ?? "";
+            const code = (e as { code?: number } | undefined)?.code ?? 1000;
+            console.log(`[live] upstream closed ${code} ${reason}`);
+            sendToClient({ upstreamClose: { code, reason } });
+            if (client.readyState === WebSocket.OPEN) client.close(1000, reason);
+          },
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[live] connect failed", msg);
+      sendToClient({ upstreamError: { message: msg } });
+      client.close(1011, msg);
+      return;
+    }
 
     client.on("message", (data, isBinary) => {
-      const payload = rawToString(data, isBinary);
-      if (upstreamOpen) upstream.send(payload);
-      else queue.push(payload);
+      let parsed: Record<string, unknown>;
+      try {
+        parsed = JSON.parse(rawToString(data, isBinary));
+      } catch (err) {
+        console.error("[live] bad client json", err);
+        return;
+      }
+      if (!session) return;
+      if (!ready) {
+        queue.push(parsed);
+        return;
+      }
+      routeClientMessage(session, parsed);
     });
+
     client.on("close", () => {
       console.log("[live] client closed");
-      if (
-        upstream.readyState === WebSocket.OPEN ||
-        upstream.readyState === WebSocket.CONNECTING
-      ) {
-        upstream.close();
+      try {
+        session?.close();
+      } catch {
+        /* ignore */
       }
     });
-    client.on("error", () => upstream.close());
+    client.on("error", () => {
+      try {
+        session?.close();
+      } catch {
+        /* ignore */
+      }
+    });
   });
+}
+
+function routeClientMessage(
+  session: Session,
+  msg: Record<string, unknown>,
+): void {
+  const realtime = msg.realtimeInput as
+    | {
+        audio?: { data?: string; mimeType?: string };
+        video?: { data?: string; mimeType?: string };
+        text?: string;
+      }
+    | undefined;
+  if (realtime?.audio?.data) {
+    session.sendRealtimeInput({
+      audio: {
+        data: realtime.audio.data,
+        mimeType: realtime.audio.mimeType ?? "audio/pcm;rate=16000",
+      },
+    });
+    return;
+  }
+  if (realtime?.video?.data) {
+    session.sendRealtimeInput({
+      video: {
+        data: realtime.video.data,
+        mimeType: realtime.video.mimeType ?? "image/jpeg",
+      },
+    });
+    return;
+  }
+  if (typeof realtime?.text === "string") {
+    session.sendRealtimeInput({ text: realtime.text });
+    return;
+  }
+  const cc = msg.clientContent as
+    | {
+        turns?: Array<{ role?: string; parts?: Array<{ text?: string }> }>;
+        turnComplete?: boolean;
+      }
+    | undefined;
+  if (cc) {
+    session.sendClientContent({
+      turns: (cc.turns ?? []).map((t) => ({
+        role: t.role ?? "user",
+        parts: (t.parts ?? []).map((p) => ({ text: p.text ?? "" })),
+      })),
+      turnComplete: cc.turnComplete ?? true,
+    });
+    return;
+  }
+  const tr = msg.toolResponse as
+    | { functionResponses?: Array<{ id: string; name?: string; response: unknown }> }
+    | undefined;
+  if (tr?.functionResponses) {
+    session.sendToolResponse({
+      functionResponses: tr.functionResponses.map((r) => ({
+        id: r.id,
+        name: r.name,
+        response: r.response as Record<string, unknown>,
+      })),
+    });
+    return;
+  }
 }
