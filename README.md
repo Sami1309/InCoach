@@ -4,11 +4,11 @@
 
 
 
-Speak what you want to improve on ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters.
+Start with what you want to improve on ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters.
 
 ## Demo flow
 
-1. **Speak intent.** Hold to talk, or type. The UI streams each agent's reasoning live: Researcher's search queries, Validator's safety diffs, parallel VideoScout / MomentMiner workers labeled `#1`, `#2`, `#3` as they finish.
+1. **Start with intent.** Hold to talk, or type. The UI streams each agent's reasoning live: Researcher's search queries, Validator's safety diffs, parallel VideoScout / MomentMiner workers labeled `#1`, `#2`, `#3` as they finish.
 2. **Routine appears.** Each drill is an embedded player with captioned moment chips. Click a chip → seek to that exact frame.
 3. **Open the Live Coach.** Hold to talk. *"Show me the follow-through."* The UI jumps; the coach narrates.
 4. **Practice on camera.** A skeleton overlays your video. `swayScore` tracks posture against the drill in real time.
