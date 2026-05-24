@@ -4,7 +4,22 @@
 
 
 
-Speak what you want to improve on ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters.
+Speak what you want to improve on ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters. The output isn't a chat transcript — it's a typed, auditable, runnable artifact you can navigate, voice-control, and form-check on camera.
+
+## Why this is different
+
+- **A compiler, not a chatbot.** Seven Gemini Managed Agent interactions lower a spoken goal into a structured `Routine` — each agent has its own schema, tools, and `thinking_level`, and every stage streams its reasoning live to the UI so users *watch* the routine compile.
+- **MomentMiner — AI-indexed video.** A multimodal sub-agent watches each drill's YouTube demo and emits second-precise, captioned key moments tied to the drill cue. Every video becomes a clickable scrubber, not a wall of footage.
+- **A voice coach that drives the UI.** The Live Coach is a Gemini Live audio session with function-calling. Ask *"show me the follow-through"* — the model calls `show_moment(idx)`, the embedded player jumps to that frame, and the coach narrates what's on screen. Voice doesn't *describe* the app; it *operates* it.
+- **Closed-loop practice.** An in-browser MediaPipe Pose landmarker overlays your skeleton, tracks shoulder-midpoint drift against a baseline, and emits a `swayScore` keyed to the current drill — the same compiled artifact, now form-checked.
+- **Auditable safety.** The `Validator` sub-agent doesn't rewrite the routine silently — it returns explicit `field / before / after / reason` diffs for every cue it tightens. Corrections you can read.
+
+## Demo flow
+
+1. **Speak intent.** Hold to talk, or type. The UI streams each agent's reasoning live: Researcher's search queries, Validator's safety diffs, parallel VideoScout / MomentMiner workers labeled `#1`, `#2`, `#3` as they finish.
+2. **Routine appears.** Each drill is an embedded player with captioned moment chips. Click a chip → seek to that exact frame.
+3. **Open the Live Coach.** Hold to talk. *"Show me the follow-through."* The UI jumps; the coach narrates.
+4. **Practice on camera.** A skeleton overlays your video. `swayScore` tracks posture against the drill in real time.
 
 ## Description
 
@@ -18,10 +33,23 @@ Speak what you want to improve on ("fix my slice in 20 min, sore back") and a mu
 
 **Flow.** Speak intent → watch the agents compile a routine → scrub the mined moments → enable camera + voice → practice with a coach that can drive your screen.
 
+## How the Managed Agents compose
+
+The pipeline uses Gemini's **Managed Agents** (the Interactions API), not raw `generateContent`. Each sub-agent is a single `ai.interactions.create(...)` call with its own `system_instruction`, `thinking_level`, an optional Zod-derived JSON `response_format`, and a toolset drawn from `google_search`, `url_context`, declared functions, or a multimodal video input. Gemini executes the interaction server-side and streams a typed step taxonomy (`thought`, `model_output`, `google_search_call`, `url_context_call`, `function_call`, …) wrapped in lifecycle events. We never round-trip search or URL fetches through our code — the managed agent runs them itself; we only observe.
+
+`runInteraction()` in `server/src/gemini.ts` accumulates output text, collects citation annotations into `sources[]`, enforces structured output by re-parsing with Zod, and exposes an `onEvent` callback. `server/src/agents.ts` wires that callback through a `bridge()` function that maps each step into a labeled `AgentEvent` (`"google search: <query>"`, `"thinking…"`, `"calling tool"`, …) and forwards it over WebSocket so the client renders every move the agent makes.
+
+`runPipeline()` composes seven of those interactions into a directed graph: `IntentParser` → `Researcher` (google_search) → optional `VideoIngest` (video URL) → `Compositor` → `Validator` (returns routine + diff array) → `Promise.all` fanout of `VideoScout` sub-agents → `Promise.all` fanout of `MomentMiner` sub-agents. The pipeline shape and parallelism are plain JS; per-step reasoning, search grounding, video understanding, citation tracking, and JSON-conformant output are all the Managed Agent's job — which is what lets each agent be defined in ~10 lines of config instead of a hand-built tool loop.
+
+## The Live Coach (Gemini Live API)
+
+A second managed surface — `ai.live.connect` — opens a bidirectional audio session with input/output transcription and barge-in. It's declared with two function tools, `play_step(step_index)` and `show_moment(moment_index)`. The model decides when to call them; when it does, the server forwards the call to the client, the UI navigates accordingly, and the coach narrates the result. This makes voice a control plane, not a chat surface.
+
 ## Stack
 - Server: Node 20, Express, `ws`
-- Client: React + Vite, MediaPipe Pose
-- LLM: Gemini Managed Agents (Interactions API) via `@google/genai`
+- Client: React + Vite, MediaPipe Pose (`@mediapipe/tasks-vision`)
+- LLM: Gemini **Managed Agents** (Interactions API) + **Live API** via `@google/genai`
+- Validation: Zod schemas → JSON Schema via `zod-to-json-schema`
 
 ## Managed Agent Architecture
 
@@ -39,8 +67,10 @@ npm run dev
 Open http://localhost:5173.
 
 ## Layout
-- `server/src/gemini.ts` — Managed Agents wrapper (`runInteraction`)
-- `server/src/agents.ts` — pipeline: IntentParser → Researcher → VideoIngest → Compositor → Validator → VideoScout · MomentMiner
-- `server/src/live.ts` — live voice session
-- `client/src/` — UI, audio capture, pose
-- `shared/types.ts` — shared event/result types
+- `server/src/gemini.ts` — Managed Agents wrapper (`runInteraction`), event stream consumer, Zod re-parse
+- `server/src/agents.ts` — pipeline graph: IntentParser → Researcher → VideoIngest → Compositor → Validator → VideoScout · MomentMiner
+- `server/src/live.ts` — Gemini Live voice session with `play_step` / `show_moment` tool calls
+- `client/src/pose.ts` — MediaPipe Pose loop + sway scoring
+- `client/src/live.ts` — client-side live audio bridge, PCM playback, barge-in
+- `client/src/App.tsx` — agent stream UI, drill cards with moment chips, voice + camera panels
+- `shared/types.ts` — `AgentEvent`, `Routine`, `DrillVideo`, `DrillMoment`, `ValidatorDiff`
