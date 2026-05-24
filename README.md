@@ -4,15 +4,7 @@
 
 
 
-Speak what you want to improve on ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters. The output isn't a chat transcript — it's a typed, auditable, runnable artifact you can navigate, voice-control, and form-check on camera.
-
-## Why this is different
-
-- **A compiler, not a chatbot.** Seven Gemini Managed Agent interactions lower a spoken goal into a structured `Routine` — each agent has its own schema, tools, and `thinking_level`, and every stage streams its reasoning live to the UI so users *watch* the routine compile.
-- **MomentMiner — AI-indexed video.** A multimodal sub-agent watches each drill's YouTube demo and emits second-precise, captioned key moments tied to the drill cue. Every video becomes a clickable scrubber, not a wall of footage.
-- **A voice coach that drives the UI.** The Live Coach is a Gemini Live audio session with function-calling. Ask *"show me the follow-through"* — the model calls `show_moment(idx)`, the embedded player jumps to that frame, and the coach narrates what's on screen. Voice doesn't *describe* the app; it *operates* it.
-- **Closed-loop practice.** An in-browser MediaPipe Pose landmarker overlays your skeleton, tracks shoulder-midpoint drift against a baseline, and emits a `swayScore` keyed to the current drill — the same compiled artifact, now form-checked.
-- **Auditable safety.** The `Validator` sub-agent doesn't rewrite the routine silently — it returns explicit `field / before / after / reason` diffs for every cue it tightens. Corrections you can read.
+Speak what you want to improve on ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters.
 
 ## Demo flow
 
