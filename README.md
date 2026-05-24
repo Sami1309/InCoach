@@ -2,7 +2,8 @@
 
 <img width="1672" height="941" alt="image" src="https://github.com/user-attachments/assets/a7240252-8b77-43d3-a9d5-1bcc055e715d" />
 
-An AI visual golf coach. Speak an intent ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters.
+
+Speak what you want to improve on ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters.
 
 ## Description
 
