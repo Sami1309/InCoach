@@ -53,10 +53,47 @@ export function attachLiveProxy(server: Server) {
           systemInstruction: {
             parts: [
               {
-                text: "You are an encouraging, concise live coach. Reply in one breath. Wait for the client to set context.",
+                text: "You are an encouraging, concise live coach. Reply in one breath — one or two short sentences max. The client gives you the routine and current step via [STATE] messages. When the user asks you to demonstrate, show a moment, advance, or replay, CALL the matching tool (play_step / show_moment) so the UI follows along, then briefly narrate what they will see. Don't describe the tool — just call it.",
               },
             ],
           },
+          tools: [
+            {
+              functionDeclarations: [
+                {
+                  name: "play_step",
+                  description:
+                    "Switch the user's drill to step at the given index and start playing its video. Use this when the user asks to start, restart, skip ahead, go back, or move on.",
+                  parameters: {
+                    type: "OBJECT" as never,
+                    properties: {
+                      step_index: {
+                        type: "INTEGER" as never,
+                        description: "0-based drill step index",
+                      },
+                    },
+                    required: ["step_index"],
+                  },
+                },
+                {
+                  name: "show_moment",
+                  description:
+                    "Within the current drill step's video, jump to a specific key moment (0-based). Use when the user asks to see the setup, the strike, the follow-through, or any specific phase.",
+                  parameters: {
+                    type: "OBJECT" as never,
+                    properties: {
+                      moment_index: {
+                        type: "INTEGER" as never,
+                        description:
+                          "0-based moment index within the current step's video",
+                      },
+                    },
+                    required: ["moment_index"],
+                  },
+                },
+              ],
+            },
+          ],
           inputAudioTranscription: {},
           outputAudioTranscription: {},
         },

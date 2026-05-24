@@ -310,7 +310,16 @@ export async function runPipeline(
           schema: VideoPickSchema,
           onEvent: bridge(emit, "videos", agentName),
         });
-        const id = extractVideoId(pick.parsed!.url);
+        if (!pick.parsed) {
+          emit({
+            stage: "videos",
+            agent: agentName,
+            status: "error",
+            message: `No usable result for step ${idx + 1}`,
+          });
+          return;
+        }
+        const id = extractVideoId(pick.parsed.url);
         if (id) {
           const v: DrillVideo = {
             stepIndex: idx,

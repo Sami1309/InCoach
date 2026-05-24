@@ -14,6 +14,8 @@ interface Memory {
   savedAt: number;
 }
 
+type Message = { role: "user" | "model"; text: string; closed: boolean };
+
 export function App() {
   const [transcript, setTranscript] = useState(
     "I'm hitting a lot of fat shots with my 7-iron. Indoor mat at home, 15 minutes.",
@@ -25,6 +27,10 @@ export function App() {
   const [compiling, setCompiling] = useState(false);
   const [recalled, setRecalled] = useState<Memory | null>(null);
   const [stepIdx, setStepIdx] = useState(0);
+  const [momentIdx, setMomentIdx] = useState(0);
+  const [autoplay, setAutoplay] = useState(false);
+  const [agentOpen, setAgentOpen] = useState(true);
+  const [diffOpen, setDiffOpen] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -35,10 +41,7 @@ export function App() {
   const streamRef = useRef<MediaStream | null>(null);
 
   const [liveOn, setLiveOn] = useState(false);
-  const [messages, setMessages] = useState<
-    { role: "user" | "model"; text: string; closed: boolean }[]
-  >([]);
-  const [liveStatus, setLiveStatus] = useState<string[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [voiceState, setVoiceState] = useState<
     "idle" | "listening" | "thinking" | "speaking"
   >("idle");
@@ -48,6 +51,8 @@ export function App() {
   const lastSwayPushRef = useRef(0);
   const userSpeakingRef = useRef(false);
   const userQuietSinceRef = useRef<number | null>(null);
+
+  const agentScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const raw = localStorage.getItem(MEMORY_KEY);
@@ -60,11 +65,20 @@ export function App() {
     }
   }, []);
 
+  useEffect(() => {
+    if (!agentOpen) return;
+    const el = agentScrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [events, agentOpen]);
+
   const compile = async () => {
     setEvents([]);
     setResult(null);
     setStepIdx(0);
+    setMomentIdx(0);
+    setAutoplay(false);
     setCompiling(true);
+    setAgentOpen(true);
     const params = new URLSearchParams({ transcript, sport });
     if (youtubeUrl.trim()) params.set("youtubeUrl", youtubeUrl.trim());
     const es = new EventSource(`/api/compile?${params.toString()}`);
@@ -84,6 +98,7 @@ export function App() {
           };
           localStorage.setItem(MEMORY_KEY, JSON.stringify(mem));
           setRecalled(mem);
+          setAgentOpen(false);
         }
         if (ev.stage === "done" || ev.stage === "error") {
           es.close();
@@ -130,77 +145,76 @@ export function App() {
   };
 
   const buildSystem = (r: CompileResult | null) => {
-    const base = `You are an encouraging ${sport} coach for the user's session: "${transcript}". Keep cues short (one breath), calm, corrective. If the user mentions pain, pause and recommend a safety screen. The user can interrupt you at any time.`;
+    const base = `You are an encouraging ${sport} coach for the user's session: "${transcript}". Keep cues short — one breath, one or two short sentences. If the user mentions pain, pause and recommend a safety screen. The user can interrupt you any time.`;
     if (!r) return base;
     const lines = r.validated.steps
-      .map((s, i) => `${i + 1}. ${s.title} — ${s.cue} (${s.reps}x, ${s.durationSec}s)`)
+      .map(
+        (s, i) =>
+          `${i}: ${s.title} — ${s.cue} (${s.reps}x, ${s.durationSec}s)`,
+      )
       .join("\n");
-    return `${base}\nRoutine: ${r.validated.title}.\nSteps:\n${lines}\nWhen the user advances a step or you receive a [STATE] message, briefly call the new cue. Use [POSE] hints to coach posture in real time.`;
+    return `${base}\nRoutine: ${r.validated.title}.\nSteps (0-indexed):\n${lines}\nWhen the user asks to start, replay, advance, go back, or to show a specific phase, CALL the matching tool: play_step(step_index) or show_moment(moment_index). Don't describe the call — just call it and then briefly narrate.`;
   };
 
-  const pushStatus = (s: string) =>
-    setLiveStatus((prev) => [...prev.slice(-6), s]);
-
-  const appendMessage = (role: "user" | "model", text: string) => {
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (last && last.role === role && !last.closed) {
-        const next = prev.slice(0, -1);
-        const sep =
-          last.text && /[\w]$/.test(last.text) && /^[\w]/.test(text) ? " " : "";
-        next.push({ role, text: last.text + sep + text, closed: false });
-        return next;
-      }
-      if (last && !last.closed) {
-        prev = [...prev.slice(0, -1), { ...last, closed: true }];
-      }
-      return [...prev.slice(-20), { role, text, closed: false }];
-    });
-  };
-
-  const closeOpenMessage = () => {
-    setMessages((prev) => {
-      const last = prev[prev.length - 1];
-      if (!last || last.closed) return prev;
-      return [...prev.slice(0, -1), { ...last, closed: true }];
+  const handleToolCall = (
+    id: string,
+    name: string,
+    args: Record<string, unknown>,
+  ) => {
+    let ok = false;
+    if (name === "play_step" && typeof args.step_index === "number" && result) {
+      const i = Math.max(
+        0,
+        Math.min(result.validated.steps.length - 1, args.step_index),
+      );
+      setStepIdx(i);
+      setMomentIdx(0);
+      setAutoplay(true);
+      ok = true;
+    } else if (
+      name === "show_moment" &&
+      typeof args.moment_index === "number" &&
+      result
+    ) {
+      const v = result.videos.find((x) => x.stepIndex === stepIdx);
+      const max = (v?.moments?.length ?? 1) - 1;
+      const m = Math.max(0, Math.min(Math.max(max, 0), args.moment_index));
+      setMomentIdx(m);
+      setAutoplay(true);
+      ok = true;
+    }
+    liveRef.current?.sendToolResponse(id, {
+      status: ok ? "ok" : "unknown_tool_or_args",
     });
   };
 
   const startLive = async (r: CompileResult | null) => {
     if (liveRef.current) return;
     setMessages([]);
-    setLiveStatus([]);
     setVoiceState("idle");
     const session = new LiveSession({
       systemInstruction: buildSystem(r),
       onEvent: (e) => {
         if (e.kind === "transcript") {
-          appendMessage(e.role, e.text);
+          appendMessage(setMessages, e.role, e.text);
           if (e.role === "model") setVoiceState("speaking");
         } else if (e.kind === "modelAudio") {
           setVoiceState("speaking");
         } else if (e.kind === "turnEnd") {
-          closeOpenMessage();
+          closeOpenMessage(setMessages);
           setVoiceState("idle");
         } else if (e.kind === "interrupted") {
-          closeOpenMessage();
+          closeOpenMessage(setMessages);
           setVoiceState("listening");
-          pushStatus("interrupted");
+        } else if (e.kind === "toolCall") {
+          handleToolCall(e.id, e.name, e.args as Record<string, unknown>);
         } else if (e.kind === "open") {
-          pushStatus("connected");
           session.sendText(
             r
-              ? `Greet me in one short sentence and announce we're starting step 1: ${r.validated.steps[0]?.title}.`
-              : "Greet me in one short sentence and ask what we're working on today.",
+              ? `Greet me in one short sentence and announce we are on step 0: ${r.validated.steps[0]?.title}.`
+              : "Greet me briefly and ask what we are working on today.",
           );
           setVoiceState("thinking");
-        } else if (e.kind === "close") {
-          pushStatus(`closed ${e.reason ?? ""}`);
-          setVoiceState("idle");
-        } else if (e.kind === "info") {
-          pushStatus(e.text);
-        } else if (e.kind === "error") {
-          pushStatus(`error: ${e.message}`);
         }
       },
     });
@@ -224,17 +238,13 @@ export function App() {
             else if (Date.now() - userQuietSinceRef.current > 350) {
               userSpeakingRef.current = false;
               userQuietSinceRef.current = null;
-              setVoiceState((cur) =>
-                cur === "listening" ? "thinking" : cur,
-              );
+              setVoiceState((cur) => (cur === "listening" ? "thinking" : cur));
             }
           }
         },
       });
-    } catch (err) {
-      pushStatus(
-        `Mic blocked: ${err instanceof Error ? err.message : String(err)}`,
-      );
+    } catch {
+      /* mic denied */
     }
     setLiveOn(true);
   };
@@ -261,7 +271,7 @@ export function App() {
     const step = result.validated.steps[stepIdx];
     if (!step) return;
     liveRef.current.sendText(
-      `[STATE] Now on step ${stepIdx + 1}/${result.validated.steps.length}: ${step.title}. Cue: ${step.cue}. Target ${step.reps} reps over ${step.durationSec}s.`,
+      `[STATE] step_index=${stepIdx} of ${result.validated.steps.length}. Title: ${step.title}. Cue: ${step.cue}.`,
     );
   }, [stepIdx, result]);
 
@@ -275,7 +285,7 @@ export function App() {
       lastSwayPushRef.current = now;
       if (Math.abs(s) >= 2) {
         liveRef.current.sendText(
-          `[POSE] sternum sway Δ ${s.toFixed(1)} ${s > 0 ? "right" : "left"} of baseline. Coach if drift exceeds 3.`,
+          `[POSE] sway Δ ${s.toFixed(1)} ${s > 0 ? "right" : "left"}.`,
         );
       }
     }, 1000);
@@ -290,19 +300,25 @@ export function App() {
     if (recalled.result) {
       setResult(recalled.result);
       setStepIdx(0);
+      setMomentIdx(0);
+      setAgentOpen(false);
     }
   };
 
   const platformLine = useMemo(() => {
     if (!result) return null;
     const intent = result.intent;
-    return `${cap(intent.activity)} coach platform — first MVP: ${sport}. Compiles ${intent.durationMinutes}-min ${intent.skillLevel} routines from voice, validates them, finds video demos, and coaches live.`;
-  }, [result, sport]);
+    return `${cap(intent.activity)} coach — voice-first. Compiles ${intent.durationMinutes}-min routines from one sentence and coaches you through them live.`;
+  }, [result]);
 
   const steps = result?.validated.steps ?? [];
   const currentStep = steps[stepIdx];
   const videoForStep = (i: number): DrillVideo | undefined =>
     result?.videos.find((v) => v.stepIndex === i);
+  const currentVideo = videoForStep(stepIdx);
+  const currentMoment = currentVideo?.moments?.[momentIdx];
+  const currentT =
+    currentMoment?.t ?? currentVideo?.start ?? currentVideo?.moments?.[0]?.t;
 
   return (
     <div className="app">
@@ -310,286 +326,335 @@ export function App() {
         <div className="brand">
           <span className="dot" />
           Coach Compiler
-          <span className="sub mono">v0.1 · gemini-3.5-flash</span>
+          <span className="sub mono">gemini-3.5-flash · managed agents</span>
         </div>
         <div className="row">
-          {recalled && (
+          {recalled && !liveOn && (
             <button onClick={recall} title={`Saved ${timeAgo(recalled.savedAt)}`}>
-              Recall last session
+              Recall last
             </button>
           )}
-          <button onClick={toggleLive}>
-            {liveOn ? "Mute coach" : "Talk to coach"}
+          <button onClick={togglePose}>
+            {poseOn ? "Camera off" : "Camera"}
           </button>
-          <span className={`pill ${liveOn ? "ok" : ""}`}>
-            <span style={dotStyle(liveOn)} /> Live voice
-          </span>
-          <span className={`pill ${poseOn ? "ok" : ""}`}>
-            <span style={dotStyle(poseOn)} /> Pose
-          </span>
+          <button
+            className={liveOn ? "" : "primary"}
+            onClick={toggleLive}
+          >
+            {liveOn ? "End coach" : "Talk to coach"}
+          </button>
         </div>
       </header>
 
       <div className="main">
-        <div className="col">
+        <aside className="sidebar">
           <section className="card">
             <div className="card-header">
               <span className="card-title">Brief</span>
             </div>
             <div className="card-body controls">
-              <div>
-                <div className="label">Sport</div>
-                <input
-                  type="text"
-                  value={sport}
-                  onChange={(e) => setSport(e.target.value)}
-                />
-              </div>
-              <div>
-                <div className="label">What do you want to work on?</div>
-                <textarea
-                  value={transcript}
-                  onChange={(e) => setTranscript(e.target.value)}
-                />
-              </div>
-              <div>
-                <div className="label">YouTube reference (optional)</div>
-                <input
-                  type="text"
-                  placeholder="https://youtube.com/..."
-                  value={youtubeUrl}
-                  onChange={(e) => setYoutubeUrl(e.target.value)}
-                />
-              </div>
-              <div className="row between">
+              <input
+                type="text"
+                value={sport}
+                onChange={(e) => setSport(e.target.value)}
+                placeholder="sport"
+              />
+              <textarea
+                value={transcript}
+                onChange={(e) => setTranscript(e.target.value)}
+                placeholder="What do you want to work on?"
+              />
+              <input
+                type="text"
+                value={youtubeUrl}
+                placeholder="YouTube reference (optional)"
+                onChange={(e) => setYoutubeUrl(e.target.value)}
+              />
+              <button
+                className="primary block"
+                onClick={compile}
+                disabled={compiling || !transcript.trim()}
+              >
+                {compiling ? "Compiling…" : "Compile routine"}
+              </button>
+            </div>
+          </section>
+
+          <section className="card flex-1">
+            <div className="card-header">
+              <span className="card-title">
+                {result ? "Routine" : compiling ? "Building" : "—"}
+              </span>
+              {result && result.diffs.length > 0 && (
                 <button
-                  className="primary"
-                  onClick={compile}
-                  disabled={compiling || !transcript.trim()}
+                  className="chip"
+                  onClick={() => setDiffOpen((v) => !v)}
+                  title="Validator corrections"
                 >
-                  {compiling ? "Compiling…" : "Compile routine"}
+                  {result.diffs.length} validated
                 </button>
-                <button onClick={togglePose}>
-                  {poseOn ? "Stop camera" : "Start camera"}
-                </button>
-              </div>
-              {platformLine && (
+              )}
+            </div>
+            <div className="card-body">
+              {result ? (
+                <RoutineOutline
+                  result={result}
+                  stepIdx={stepIdx}
+                  onSelect={(i) => {
+                    setStepIdx(i);
+                    setMomentIdx(0);
+                    setAutoplay(true);
+                  }}
+                  diffOpen={diffOpen}
+                />
+              ) : compiling ? (
+                <ProgressCard events={events} />
+              ) : (
+                <div className="empty">
+                  Tell me what you want to work on, then hit Compile.
+                </div>
+              )}
+              {platformLine && result && (
                 <div className="footer-line">{platformLine}</div>
               )}
             </div>
           </section>
+        </aside>
 
-          <section className="card" style={{ flex: 1 }}>
-            <div className="card-header">
-              <span className="card-title">Agent activity</span>
-              <span
-                className="mono"
-                style={{ color: "var(--muted)", fontSize: 11 }}
-              >
-                {events.length} events
-              </span>
-            </div>
-            <div className="card-body">
-              {events.length === 0 ? (
-                <div className="empty">
-                  No agents running. Hit “Compile routine”.
-                </div>
-              ) : (
-                <div className="timeline">
-                  {events.map((e, i) => (
-                    <EventCard key={i} e={e} />
-                  ))}
+        <section className="hero">
+          <div className="hero-grid">
+            <div className="coach">
+              <video ref={videoRef} muted playsInline />
+              <canvas ref={canvasRef} />
+              {!poseOn && (
+                <div className="overlay">
+                  <span className="mono" style={{ opacity: 0.55 }}>
+                    Camera off
+                  </span>
                 </div>
               )}
-            </div>
-          </section>
-        </div>
-
-        <div className="col">
-          <section className="card">
-            <div className="card-header">
-              <span className="card-title">Live coach</span>
               {sway != null && (
-                <span className="metric">
-                  <span className="v mono">{sway.toFixed(1)}</span>
-                  <span className="u">sway Δ</span>
-                </span>
+                <div className="sway-badge">
+                  <span className="mono">sway Δ {sway.toFixed(1)}</span>
+                </div>
               )}
             </div>
-            <div className="card-body" style={{ padding: 14 }}>
-              <div className="coach">
-                <video ref={videoRef} muted playsInline />
-                <canvas ref={canvasRef} />
-                {!poseOn && (
-                  <div className="overlay">
-                    Camera off — start it to see your pose.
-                  </div>
-                )}
-              </div>
-              {liveOn && (
-                <VoiceBar
-                  state={voiceState}
-                  level={micLevel}
-                  status={liveStatus}
-                />
-              )}
-              {result && currentStep && (
+
+            <div className="hero-right">
+              <VoiceBar
+                state={voiceState}
+                level={micLevel}
+                liveOn={liveOn}
+              />
+              {result && currentStep ? (
                 <DrillRunner
                   total={steps.length}
                   index={stepIdx}
-                  title={currentStep.title}
-                  cue={currentStep.cue}
-                  reps={currentStep.reps}
-                  durationSec={currentStep.durationSec}
-                  video={videoForStep(stepIdx)}
-                  onPrev={() => setStepIdx((i) => Math.max(0, i - 1))}
-                  onNext={() =>
-                    setStepIdx((i) => Math.min(steps.length - 1, i + 1))
-                  }
+                  step={currentStep}
+                  video={currentVideo}
+                  moments={currentVideo?.moments ?? []}
+                  momentIdx={momentIdx}
+                  startT={currentT}
+                  autoplay={autoplay}
+                  onPrev={() => {
+                    setStepIdx((i) => Math.max(0, i - 1));
+                    setMomentIdx(0);
+                    setAutoplay(true);
+                  }}
+                  onNext={() => {
+                    setStepIdx((i) => Math.min(steps.length - 1, i + 1));
+                    setMomentIdx(0);
+                    setAutoplay(true);
+                  }}
+                  onSelectMoment={(i) => {
+                    setMomentIdx(i);
+                    setAutoplay(true);
+                  }}
                 />
+              ) : (
+                <div className="hero-placeholder">
+                  {compiling ? (
+                    <ProgressCard events={events} large />
+                  ) : (
+                    <div className="empty">
+                      Your drill will appear here. Hit Compile to start.
+                    </div>
+                  )}
+                </div>
               )}
               <LiveMessages messages={messages} />
             </div>
-          </section>
-        </div>
-
-        <div className="col">
-          <section className="card">
-            <div className="card-header">
-              <span className="card-title">Routine</span>
-            </div>
-            <div className="card-body">
-              {result ? (
-                <Routine
-                  result={result}
-                  stepIdx={stepIdx}
-                  onSelect={(i) => setStepIdx(i)}
-                />
-              ) : (
-                <div className="empty">No routine yet.</div>
-              )}
-            </div>
-          </section>
-
-          <section className="card" style={{ flex: 1 }}>
-            <div className="card-header">
-              <span className="card-title">Validator diff</span>
-            </div>
-            <div className="card-body">
-              {result && result.diffs.length > 0 ? (
-                <div>
-                  {result.diffs.map((d, i) => (
-                    <div className="diff" key={i}>
-                      <div className="k">{d.field}</div>
-                      <div>
-                        <div className="before">− {d.before}</div>
-                        <div className="after">+ {d.after}</div>
-                        <div className="why">{d.reason}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <div className="empty">
-                  {result ? "No corrections — clean draft." : "Awaiting compile."}
-                </div>
-              )}
-            </div>
-          </section>
-        </div>
+          </div>
+        </section>
       </div>
+
+      <AgentDrawer
+        open={agentOpen}
+        onToggle={() => setAgentOpen((v) => !v)}
+        events={events}
+        scrollRef={agentScrollRef}
+        compiling={compiling}
+      />
     </div>
   );
 }
 
-function EventCard({ e }: { e: AgentEvent }) {
-  const cls = `event stage-${e.stage} status-${e.status}`;
+function appendMessage(
+  set: React.Dispatch<React.SetStateAction<Message[]>>,
+  role: "user" | "model",
+  text: string,
+) {
+  set((prev) => {
+    const last = prev[prev.length - 1];
+    if (last && last.role === role && !last.closed) {
+      const sep =
+        last.text && /[\w]$/.test(last.text) && /^[\w]/.test(text) ? " " : "";
+      const next = prev.slice(0, -1);
+      next.push({ role, text: last.text + sep + text, closed: false });
+      return next;
+    }
+    const updated = last && !last.closed ? [...prev.slice(0, -1), { ...last, closed: true }] : prev;
+    return [...updated.slice(-16), { role, text, closed: false }];
+  });
+}
+
+function closeOpenMessage(
+  set: React.Dispatch<React.SetStateAction<Message[]>>,
+) {
+  set((prev) => {
+    const last = prev[prev.length - 1];
+    if (!last || last.closed) return prev;
+    return [...prev.slice(0, -1), { ...last, closed: true }];
+  });
+}
+
+function VoiceBar({
+  state,
+  level,
+  liveOn,
+}: {
+  state: "idle" | "listening" | "thinking" | "speaking";
+  level: number;
+  liveOn: boolean;
+}) {
+  const label = !liveOn
+    ? "Tap “Talk to coach” to start"
+    : state === "listening"
+      ? "Listening…"
+      : state === "thinking"
+        ? "Coach thinking…"
+        : state === "speaking"
+          ? "Coach speaking"
+          : "Listening for you";
+  const pct = Math.min(100, Math.round(level * 100 * 6));
   return (
-    <div className={cls}>
-      <div className="top">
-        <span className="stage">
-          {e.agent ?? e.stage}
-          {e.model ? <span className="model"> · {e.model}</span> : null}
-        </span>
-        <span className="ts mono">{fmtTime(e.ts)}</span>
+    <div className={`voicebar voice-${liveOn ? state : "off"}`}>
+      <div className="row" style={{ gap: 10, alignItems: "center" }}>
+        <span className="vdot" />
+        <span style={{ fontWeight: 600 }}>{label}</span>
       </div>
-      <div className="msg">{e.message}</div>
-      {e.query && (
-        <pre className="query">
-          <span className="qmark">›</span> {truncate(e.query, 240)}
-        </pre>
-      )}
-      {e.status === "result" && Boolean(e.data) && (
-        <pre className="data">{summarize(e.data)}</pre>
+      <div className="level">
+        <div className="level-fill" style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function ProgressCard({
+  events,
+  large = false,
+}: {
+  events: AgentEvent[];
+  large?: boolean;
+}) {
+  const stages: { key: AgentEvent["stage"]; label: string }[] = [
+    { key: "intent", label: "Understanding intent" },
+    { key: "researcher", label: "Researching drills" },
+    { key: "youtube", label: "Reading reference video" },
+    { key: "compositor", label: "Composing routine" },
+    { key: "validator", label: "Validating safety" },
+    { key: "videos", label: "Finding demos & moments" },
+  ];
+  const stageState = (k: AgentEvent["stage"]) => {
+    const matching = events.filter((e) => e.stage === k);
+    if (matching.length === 0) return "pending" as const;
+    if (matching.some((m) => m.status === "result")) return "done" as const;
+    if (matching.some((m) => m.status === "error")) return "error" as const;
+    return "running" as const;
+  };
+  const latest = events.slice(-1)[0];
+  return (
+    <div className={`progress ${large ? "progress-lg" : ""}`}>
+      <ul>
+        {stages.map((s) => {
+          const st = stageState(s.key);
+          const skip = s.key === "youtube" && st === "pending";
+          if (skip) return null;
+          return (
+            <li key={s.key} className={`progress-row p-${st}`}>
+              <span className="icon">
+                {st === "done" ? "✓" : st === "running" ? "" : "○"}
+              </span>
+              <span>{s.label}</span>
+            </li>
+          );
+        })}
+      </ul>
+      {latest && (
+        <div className="progress-latest mono">
+          {latest.agent ?? latest.stage}: {truncate(latest.message, 60)}
+        </div>
       )}
     </div>
   );
 }
 
-function Routine({
+function RoutineOutline({
   result,
   stepIdx,
   onSelect,
+  diffOpen,
 }: {
   result: CompileResult;
   stepIdx: number;
   onSelect: (i: number) => void;
+  diffOpen: boolean;
 }) {
   const r = result.validated;
   return (
-    <div className="steps">
-      <div>
-        <div style={{ fontSize: 16, fontWeight: 600 }}>{r.title}</div>
-        <div style={{ color: "var(--muted)", fontSize: 13, marginTop: 4 }}>
-          {r.summary}
-        </div>
-        <div style={{ marginTop: 8 }}>
-          {r.cues.map((c, i) => (
-            <span className="tag" key={i}>
-              {c}
-            </span>
-          ))}
-        </div>
+    <div className="outline">
+      <div className="outline-head">
+        <div className="outline-title">{r.title}</div>
+        <div className="outline-sub">{r.summary}</div>
       </div>
-      {r.steps.map((s, i) => {
-        const v = result.videos.find((x) => x.stepIndex === i);
-        const active = i === stepIdx;
-        return (
-          <button
-            key={i}
-            onClick={() => onSelect(i)}
-            className={`step ${active ? "active" : ""}`}
-          >
-            <div className="step-row">
-              {v ? (
-                <img src={v.thumb} alt="" className="step-thumb" />
-              ) : (
-                <div className="step-thumb placeholder" />
-              )}
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <div className="title">
-                  {i + 1}. {s.title}
-                </div>
-                <div className="cue">{s.cue}</div>
-                <div className="meta">
-                  {s.reps} reps · {s.durationSec}s
-                  {s.focusLandmark ? ` · ${s.focusLandmark}` : ""}
-                </div>
+      <ol className="outline-list">
+        {r.steps.map((s, i) => {
+          const v = result.videos.find((x) => x.stepIndex === i);
+          return (
+            <li
+              key={i}
+              className={`outline-step ${i === stepIdx ? "active" : ""}`}
+            >
+              <button onClick={() => onSelect(i)}>
+                <span className="num">{i + 1}</span>
+                <span className="title">{s.title}</span>
+                {v && <span className="dot-video" title="video available" />}
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+      {diffOpen && result.diffs.length > 0 && (
+        <div className="diffs">
+          <div className="label">Validator corrections</div>
+          {result.diffs.map((d, i) => (
+            <div className="diff" key={i}>
+              <div className="k mono">{d.field}</div>
+              <div>
+                <div className="before">− {d.before}</div>
+                <div className="after">+ {d.after}</div>
+                <div className="why">{d.reason}</div>
               </div>
-            </div>
-          </button>
-        );
-      })}
-      {result.sources.length > 0 && (
-        <div>
-          <div className="label" style={{ marginTop: 8 }}>
-            Sources
-          </div>
-          {result.sources.slice(0, 4).map((s, i) => (
-            <div key={i} style={{ fontSize: 12, marginTop: 4 }}>
-              <a href={s} target="_blank" rel="noreferrer">
-                {prettyUrl(s)}
-              </a>
             </div>
           ))}
         </div>
@@ -601,43 +666,40 @@ function Routine({
 function DrillRunner({
   total,
   index,
-  title,
-  cue,
-  reps,
-  durationSec,
+  step,
   video,
+  moments,
+  momentIdx,
+  startT,
+  autoplay,
   onPrev,
   onNext,
+  onSelectMoment,
 }: {
   total: number;
   index: number;
-  title: string;
-  cue: string;
-  reps: number;
-  durationSec: number;
+  step: { title: string; cue: string; reps: number; durationSec: number };
   video?: DrillVideo;
+  moments: { t: number; caption: string; thumb: string }[];
+  momentIdx: number;
+  startT?: number;
+  autoplay: boolean;
   onPrev: () => void;
   onNext: () => void;
+  onSelectMoment: (i: number) => void;
 }) {
-  const [t, setT] = useState<number | undefined>(video?.start);
-  useEffect(() => {
-    setT(video?.start);
-  }, [video?.videoId, video?.start]);
   return (
-    <div className="drill-runner">
-      <div className="row between">
+    <div className="drill">
+      <div className="drill-head">
         <div>
           <div className="label">
             Step {index + 1} / {total}
           </div>
-          <div style={{ fontSize: 15, fontWeight: 600 }}>{title}</div>
-          <div style={{ color: "var(--muted)", fontSize: 13 }}>{cue}</div>
-          <div className="meta" style={{ marginTop: 4 }}>
-            {reps} reps · {durationSec}s
-          </div>
+          <div className="drill-title">{step.title}</div>
+          <div className="drill-cue">{step.cue}</div>
         </div>
         <div className="row">
-          <button onClick={onPrev} disabled={index === 0}>
+          <button onClick={onPrev} disabled={index === 0} aria-label="prev">
             ←
           </button>
           <button
@@ -645,64 +707,47 @@ function DrillRunner({
             onClick={onNext}
             disabled={index >= total - 1}
           >
-            Next step →
+            Next →
           </button>
         </div>
       </div>
-      {video && (
-        <>
-          <div className="yt-embed">
-            <iframe
-              key={`${video.videoId}-${t ?? 0}`}
-              src={`https://www.youtube.com/embed/${video.videoId}?rel=0&autoplay=0${t ? `&start=${t}` : ""}`}
-              title="Drill demo"
-              allow="accelerometer; encrypted-media; gyroscope; picture-in-picture"
-              allowFullScreen
-            />
-          </div>
-          {video.moments && video.moments.length > 0 && (
-            <div>
-              <div className="label" style={{ marginTop: 6 }}>
-                Key moments · validated by Gemini
-              </div>
-              <div className="moments">
-                {video.moments.map((m, i) => (
-                  <button
-                    key={i}
-                    className={`moment ${t === m.t ? "active" : ""}`}
-                    onClick={() => setT(m.t)}
-                    title={`Jump to ${fmtMmSs(m.t)}`}
-                  >
-                    <img src={m.thumb} alt="" />
-                    <div className="ts mono">{fmtMmSs(m.t)}</div>
-                    <div className="cap">{m.caption}</div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-        </>
+      {video ? (
+        <div className="yt-embed">
+          <iframe
+            key={`${video.videoId}-${startT ?? 0}-${autoplay}`}
+            src={`https://www.youtube.com/embed/${video.videoId}?rel=0&modestbranding=1${autoplay ? "&autoplay=1" : ""}${startT ? `&start=${startT}` : ""}`}
+            title={step.title}
+            allow="accelerometer; autoplay; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+          />
+        </div>
+      ) : (
+        <div className="empty-card">No video for this step yet</div>
+      )}
+      {moments.length > 0 && (
+        <div className="moments">
+          {moments.map((m, i) => (
+            <button
+              key={i}
+              className={`moment ${i === momentIdx ? "active" : ""}`}
+              onClick={() => onSelectMoment(i)}
+              title={`Jump to ${fmtMmSs(m.t)}`}
+            >
+              <img src={m.thumb} alt="" />
+              <div className="ts mono">{fmtMmSs(m.t)}</div>
+              <div className="cap">{m.caption}</div>
+            </button>
+          ))}
+        </div>
       )}
     </div>
   );
 }
 
-function fmtMmSs(sec: number) {
-  const s = Math.max(0, Math.floor(sec));
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return `${m}:${r.toString().padStart(2, "0")}`;
-}
-
-function LiveMessages({
-  messages,
-}: {
-  messages: { role: "user" | "model"; text: string; closed: boolean }[];
-}) {
+function LiveMessages({ messages }: { messages: Message[] }) {
   if (messages.length === 0) return null;
   return (
     <div className="messages">
-      <div className="label">Live transcript</div>
       {messages.map((m, i) => (
         <div
           key={i}
@@ -716,40 +761,71 @@ function LiveMessages({
   );
 }
 
-function VoiceBar({
-  state,
-  level,
-  status,
+function AgentDrawer({
+  open,
+  onToggle,
+  events,
+  scrollRef,
+  compiling,
 }: {
-  state: "idle" | "listening" | "thinking" | "speaking";
-  level: number;
-  status: string[];
+  open: boolean;
+  onToggle: () => void;
+  events: AgentEvent[];
+  scrollRef: React.RefObject<HTMLDivElement>;
+  compiling: boolean;
 }) {
-  const label =
-    state === "listening"
-      ? "Listening to you…"
-      : state === "thinking"
-        ? "Coach thinking…"
-        : state === "speaking"
-          ? "Coach speaking…"
-          : "Tap and talk anytime";
-  const pct = Math.min(100, Math.round(level * 100 * 6));
+  const latest = events[events.length - 1];
   return (
-    <div className={`voicebar voice-${state}`}>
-      <div className="row between" style={{ alignItems: "center" }}>
-        <div className="row" style={{ gap: 8, alignItems: "center" }}>
-          <span className="vdot" />
-          <span style={{ fontWeight: 600 }}>{label}</span>
-        </div>
-        <span className="mono" style={{ color: "var(--muted)", fontSize: 11 }}>
-          {status[status.length - 1] ?? ""}
+    <div className={`drawer ${open ? "open" : ""}`}>
+      <button className="drawer-handle" onClick={onToggle}>
+        <span className="mono">
+          AGENT ACTIVITY · {events.length} events
+          {compiling && <span className="spin"> ⟳</span>}
         </span>
-      </div>
-      <div className="level">
-        <div className="level-fill" style={{ width: `${pct}%` }} />
-      </div>
+        <span style={{ flex: 1 }} />
+        <span className="latest mono">
+          {latest ? `${latest.agent ?? latest.stage}: ${truncate(latest.message, 80)}` : "idle"}
+        </span>
+        <span className="arrow">{open ? "▾" : "▴"}</span>
+      </button>
+      {open && (
+        <div className="drawer-body" ref={scrollRef}>
+          {events.length === 0 ? (
+            <div className="empty">No agents running yet.</div>
+          ) : (
+            <div className="timeline">
+              {events.map((e, i) => (
+                <EventRow key={i} e={e} />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+function EventRow({ e }: { e: AgentEvent }) {
+  return (
+    <div className={`evrow stage-${e.stage} status-${e.status}`}>
+      <span className="evbar" />
+      <span className="evagent mono">{e.agent ?? e.stage}</span>
+      <span className="evmsg">{e.message}</span>
+      {e.query && (
+        <span className="evquery mono" title={e.query}>
+          {truncate(e.query, 80)}
+        </span>
+      )}
+      <span className="evts mono">{fmtTime(e.ts)}</span>
+    </div>
+  );
+}
+
+function fmtMmSs(sec: number) {
+  const s = Math.max(0, Math.floor(sec));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, "0")}`;
 }
 
 function fmtTime(ts: number) {
@@ -760,15 +836,6 @@ function fmtTime(ts: number) {
   });
 }
 
-function summarize(data: unknown): string {
-  try {
-    const s = JSON.stringify(data, null, 2);
-    return s.length > 500 ? s.slice(0, 500) + "…" : s;
-  } catch {
-    return String(data);
-  }
-}
-
 function truncate(s: string, n: number) {
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
@@ -777,29 +844,9 @@ function cap(s: string) {
   return s ? s[0].toUpperCase() + s.slice(1) : s;
 }
 
-function prettyUrl(u: string) {
-  try {
-    return new URL(u).hostname.replace(/^www\./, "");
-  } catch {
-    return u;
-  }
-}
-
 function timeAgo(ts: number) {
   const s = Math.floor((Date.now() - ts) / 1000);
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
-}
-
-function dotStyle(on: boolean): React.CSSProperties {
-  return {
-    width: 8,
-    height: 8,
-    borderRadius: 999,
-    background: on
-      ? "linear-gradient(135deg, #7df9c4, #69b7ff)"
-      : "var(--line-2)",
-    display: "inline-block",
-  };
 }
