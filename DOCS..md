@@ -152,7 +152,7 @@ Do not ship this pattern with a real long-lived API key in browser code. Use it 
 
 ```javascript
 const API_KEY = "YOUR_API_KEY";
-const MODEL_NAME = "gemini-2.5-flash";
+const MODEL_NAME = "gemini-3.5-flash";
 const WS_URL = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${API_KEY}`;
 
 const socket = new WebSocket(WS_URL);
