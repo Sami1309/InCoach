@@ -1,6 +1,9 @@
 # InCoach
 
-An AI visual coach. Speak an intent ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters.
+An AI visual golf coach. Speak an intent ("fix my slice in 20 min, sore back") and a multi-agent pipeline compiles a researched, safety-validated drill routine with key-moment video chapters.
+
+<img width="1408" height="768" alt="image" src="https://github.com/user-attachments/assets/14e22272-bebf-4c96-bd52-deb63979ae2a" />
+
 
 ## Description
 
