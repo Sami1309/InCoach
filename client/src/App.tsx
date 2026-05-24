@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { AgentEvent, CompileResult, DrillVideo } from "@shared/types";
 import { initPose, startPoseLoop, type PoseTick } from "./pose";
 import { startMicCapture, type MicCapture } from "./audio";
-import { LiveSession, type LiveEvent } from "./live";
+import { LiveSession } from "./live";
 
 const MEMORY_KEY = "coach-compiler.session";
 
@@ -35,10 +35,19 @@ export function App() {
   const streamRef = useRef<MediaStream | null>(null);
 
   const [liveOn, setLiveOn] = useState(false);
-  const [transcripts, setTranscripts] = useState<LiveEvent[]>([]);
+  const [messages, setMessages] = useState<
+    { role: "user" | "model"; text: string; closed: boolean }[]
+  >([]);
+  const [liveStatus, setLiveStatus] = useState<string[]>([]);
+  const [voiceState, setVoiceState] = useState<
+    "idle" | "listening" | "thinking" | "speaking"
+  >("idle");
+  const [micLevel, setMicLevel] = useState(0);
   const liveRef = useRef<LiveSession | null>(null);
   const micRef = useRef<MicCapture | null>(null);
   const lastSwayPushRef = useRef(0);
+  const userSpeakingRef = useRef(false);
+  const userQuietSinceRef = useRef<number | null>(null);
 
   useEffect(() => {
     const raw = localStorage.getItem(MEMORY_KEY);
@@ -129,33 +138,103 @@ export function App() {
     return `${base}\nRoutine: ${r.validated.title}.\nSteps:\n${lines}\nWhen the user advances a step or you receive a [STATE] message, briefly call the new cue. Use [POSE] hints to coach posture in real time.`;
   };
 
+  const pushStatus = (s: string) =>
+    setLiveStatus((prev) => [...prev.slice(-6), s]);
+
+  const appendMessage = (role: "user" | "model", text: string) => {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && last.role === role && !last.closed) {
+        const next = prev.slice(0, -1);
+        const sep =
+          last.text && /[\w]$/.test(last.text) && /^[\w]/.test(text) ? " " : "";
+        next.push({ role, text: last.text + sep + text, closed: false });
+        return next;
+      }
+      if (last && !last.closed) {
+        prev = [...prev.slice(0, -1), { ...last, closed: true }];
+      }
+      return [...prev.slice(-20), { role, text, closed: false }];
+    });
+  };
+
+  const closeOpenMessage = () => {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (!last || last.closed) return prev;
+      return [...prev.slice(0, -1), { ...last, closed: true }];
+    });
+  };
+
   const startLive = async (r: CompileResult | null) => {
     if (liveRef.current) return;
+    setMessages([]);
+    setLiveStatus([]);
+    setVoiceState("idle");
     const session = new LiveSession({
       systemInstruction: buildSystem(r),
       onEvent: (e) => {
-        setTranscripts((prev) => [...prev.slice(-40), e]);
-        if (e.kind === "open") {
+        if (e.kind === "transcript") {
+          appendMessage(e.role, e.text);
+          if (e.role === "model") setVoiceState("speaking");
+        } else if (e.kind === "modelAudio") {
+          setVoiceState("speaking");
+        } else if (e.kind === "turnEnd") {
+          closeOpenMessage();
+          setVoiceState("idle");
+        } else if (e.kind === "interrupted") {
+          closeOpenMessage();
+          setVoiceState("listening");
+          pushStatus("interrupted");
+        } else if (e.kind === "open") {
+          pushStatus("connected");
           session.sendText(
             r
-              ? `Greet me briefly and tell me we're starting step 1: ${r.validated.steps[0]?.title}.`
-              : "Greet me briefly and ask what we're working on today.",
+              ? `Greet me in one short sentence and announce we're starting step 1: ${r.validated.steps[0]?.title}.`
+              : "Greet me in one short sentence and ask what we're working on today.",
           );
+          setVoiceState("thinking");
+        } else if (e.kind === "close") {
+          pushStatus(`closed ${e.reason ?? ""}`);
+          setVoiceState("idle");
+        } else if (e.kind === "info") {
+          pushStatus(e.text);
+        } else if (e.kind === "error") {
+          pushStatus(`error: ${e.message}`);
         }
       },
     });
     session.connect();
     liveRef.current = session;
     try {
-      micRef.current = await startMicCapture((pcm) => session.sendAudio(pcm));
-    } catch (err) {
-      setTranscripts((prev) => [
-        ...prev,
-        {
-          kind: "error",
-          message: `Mic blocked: ${err instanceof Error ? err.message : String(err)}`,
+      micRef.current = await startMicCapture({
+        onChunk: (pcm) => session.sendAudio(pcm),
+        onLevel: (lvl) => {
+          setMicLevel(lvl);
+          const speaking = lvl > 0.02;
+          if (speaking) {
+            if (!userSpeakingRef.current) {
+              userSpeakingRef.current = true;
+              setVoiceState("listening");
+            }
+            userQuietSinceRef.current = null;
+          } else if (userSpeakingRef.current) {
+            if (userQuietSinceRef.current == null)
+              userQuietSinceRef.current = Date.now();
+            else if (Date.now() - userQuietSinceRef.current > 350) {
+              userSpeakingRef.current = false;
+              userQuietSinceRef.current = null;
+              setVoiceState((cur) =>
+                cur === "listening" ? "thinking" : cur,
+              );
+            }
+          }
         },
-      ]);
+      });
+    } catch (err) {
+      pushStatus(
+        `Mic blocked: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
     setLiveOn(true);
   };
@@ -166,6 +245,10 @@ export function App() {
     liveRef.current?.close();
     liveRef.current = null;
     setLiveOn(false);
+    setVoiceState("idle");
+    setMicLevel(0);
+    userSpeakingRef.current = false;
+    userQuietSinceRef.current = null;
   };
 
   const toggleLive = async () => {
@@ -343,6 +426,13 @@ export function App() {
                   </div>
                 )}
               </div>
+              {liveOn && (
+                <VoiceBar
+                  state={voiceState}
+                  level={micLevel}
+                  status={liveStatus}
+                />
+              )}
               {result && currentStep && (
                 <DrillRunner
                   total={steps.length}
@@ -358,7 +448,7 @@ export function App() {
                   }
                 />
               )}
-              <LiveTranscripts events={transcripts} />
+              <LiveMessages messages={messages} />
             </div>
           </section>
         </div>
@@ -604,77 +694,60 @@ function fmtMmSs(sec: number) {
   return `${m}:${r.toString().padStart(2, "0")}`;
 }
 
-function LiveTranscripts({ events }: { events: LiveEvent[] }) {
-  if (events.length === 0) return null;
+function LiveMessages({
+  messages,
+}: {
+  messages: { role: "user" | "model"; text: string; closed: boolean }[];
+}) {
+  if (messages.length === 0) return null;
   return (
-    <div
-      style={{
-        marginTop: 14,
-        display: "flex",
-        flexDirection: "column",
-        gap: 6,
-      }}
-    >
+    <div className="messages">
       <div className="label">Live transcript</div>
-      {events.slice(-12).map((e, i) => {
-        if (e.kind === "transcript") {
-          return (
-            <div key={i} style={{ fontSize: 13 }}>
-              <span
-                className="mono"
-                style={{
-                  color:
-                    e.role === "user" ? "var(--accent-2)" : "var(--accent)",
-                  marginRight: 8,
-                }}
-              >
-                {e.role}
-              </span>
-              {e.text}
-            </div>
-          );
-        }
-        if (e.kind === "toolCall") {
-          return (
-            <div
-              key={i}
-              className="mono"
-              style={{ fontSize: 12, color: "var(--warn)" }}
-            >
-              tool {e.name}({JSON.stringify(e.args)})
-            </div>
-          );
-        }
-        if (e.kind === "info" || e.kind === "open" || e.kind === "close") {
-          const text =
-            e.kind === "info"
-              ? e.text
-              : e.kind === "open"
-                ? "connected"
-                : `disconnected ${e.reason ?? ""}`;
-          return (
-            <div
-              key={i}
-              className="mono"
-              style={{ fontSize: 11, color: "var(--muted)" }}
-            >
-              · {text}
-            </div>
-          );
-        }
-        if (e.kind === "error") {
-          return (
-            <div
-              key={i}
-              className="mono"
-              style={{ fontSize: 12, color: "var(--danger)" }}
-            >
-              {e.message}
-            </div>
-          );
-        }
-        return null;
-      })}
+      {messages.map((m, i) => (
+        <div
+          key={i}
+          className={`bubble ${m.role}${!m.closed ? " streaming" : ""}`}
+        >
+          <span className="who mono">{m.role === "user" ? "you" : "coach"}</span>
+          <span className="text">{m.text}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function VoiceBar({
+  state,
+  level,
+  status,
+}: {
+  state: "idle" | "listening" | "thinking" | "speaking";
+  level: number;
+  status: string[];
+}) {
+  const label =
+    state === "listening"
+      ? "Listening to you…"
+      : state === "thinking"
+        ? "Coach thinking…"
+        : state === "speaking"
+          ? "Coach speaking…"
+          : "Tap and talk anytime";
+  const pct = Math.min(100, Math.round(level * 100 * 6));
+  return (
+    <div className={`voicebar voice-${state}`}>
+      <div className="row between" style={{ alignItems: "center" }}>
+        <div className="row" style={{ gap: 8, alignItems: "center" }}>
+          <span className="vdot" />
+          <span style={{ fontWeight: 600 }}>{label}</span>
+        </div>
+        <span className="mono" style={{ color: "var(--muted)", fontSize: 11 }}>
+          {status[status.length - 1] ?? ""}
+        </span>
+      </div>
+      <div className="level">
+        <div className="level-fill" style={{ width: `${pct}%` }} />
+      </div>
     </div>
   );
 }

@@ -4,6 +4,10 @@ export type LiveEvent =
   | { kind: "open" }
   | { kind: "close"; reason?: string }
   | { kind: "transcript"; role: "user" | "model"; text: string }
+  | { kind: "turnStart"; role: "user" | "model" }
+  | { kind: "turnEnd"; role: "user" | "model" }
+  | { kind: "interrupted" }
+  | { kind: "modelAudio" }
   | { kind: "toolCall"; id: string; name: string; args: unknown }
   | { kind: "info"; text: string }
   | { kind: "error"; message: string };
@@ -97,9 +101,14 @@ export class LiveSession {
           inputTranscription?: { text?: string };
           outputTranscription?: { text?: string };
           interrupted?: boolean;
+          turnComplete?: boolean;
+          generationComplete?: boolean;
         }
       | undefined;
-    if (sc?.interrupted) this.player.stop();
+    if (sc?.interrupted) {
+      this.player.hardStop();
+      this.opts.onEvent({ kind: "interrupted" });
+    }
     if (sc?.modelTurn?.parts) {
       for (const p of sc.modelTurn.parts) {
         const inline = p.inlineData;
@@ -116,6 +125,7 @@ export class LiveSession {
             Math.floor(bytes.byteLength / 2),
           );
           this.player.play(pcm);
+          this.opts.onEvent({ kind: "modelAudio" });
         }
       }
     }
@@ -132,6 +142,12 @@ export class LiveSession {
         role: "model",
         text: sc.outputTranscription.text,
       });
+    }
+    if (sc?.turnComplete) {
+      this.opts.onEvent({ kind: "turnEnd", role: "model" });
+    }
+    if (sc?.generationComplete) {
+      this.opts.onEvent({ kind: "turnEnd", role: "model" });
     }
     const tc = data.toolCall as
       | { functionCalls?: Array<{ id: string; name: string; args: unknown }> }
