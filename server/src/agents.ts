@@ -1,11 +1,5 @@
 import { z } from "zod";
-import {
-  generateJSON,
-  generateGrounded,
-  analyzeYouTube,
-  analyzeYouTubeJSON,
-  MODEL,
-} from "./gemini.js";
+import { runInteraction, MODEL, type StepEvent } from "./gemini.js";
 import type {
   AgentEvent,
   CompileResult,
@@ -62,10 +56,94 @@ const ValidatorSchema = z.object({
   ),
 });
 
+const VideoPickSchema = z.object({
+  url: z.string(),
+  reason: z.string().optional(),
+});
+
+const MomentsSchema = z.object({
+  moments: z
+    .array(
+      z.object({
+        t: z.number().describe("timestamp in seconds"),
+        caption: z.string(),
+      }),
+    )
+    .min(1)
+    .max(4),
+});
+
 const VIDEO_ID_RE = /(?:v=|youtu\.be\/|\/shorts\/|\/embed\/)([A-Za-z0-9_-]{11})/;
-function extractVideoId(url: string): string | null {
-  const m = url.match(VIDEO_ID_RE);
-  return m ? m[1] : null;
+const extractVideoId = (u: string) => u.match(VIDEO_ID_RE)?.[1] ?? null;
+
+function bridge(
+  emit: Emit,
+  stage: AgentEvent["stage"],
+  agentName: string,
+): (e: StepEvent) => void {
+  return (e) => {
+    if (e.kind === "step.start") {
+      const label = stepLabel(e.stepType);
+      if (label)
+        emit({
+          stage,
+          agent: agentName,
+          model: MODEL,
+          status: "thinking",
+          message: label,
+        });
+    } else if (e.kind === "step.stop") {
+      if (e.stepType === "google_search_call") {
+        const args = (e.data as { arguments?: { queries?: string[] } })
+          ?.arguments;
+        const q = args?.queries?.join(", ") ?? "";
+        emit({
+          stage,
+          agent: agentName,
+          status: "thinking",
+          message: `google search: ${q}`,
+          query: q,
+        });
+      }
+    } else if (e.kind === "status") {
+      emit({
+        stage,
+        agent: agentName,
+        status: "thinking",
+        message: `status: ${e.status}`,
+      });
+    } else if (e.kind === "error") {
+      emit({
+        stage,
+        agent: agentName,
+        status: "error",
+        message: e.message,
+      });
+    }
+  };
+}
+
+function stepLabel(t: string): string | null {
+  switch (t) {
+    case "thought":
+      return "thinking…";
+    case "model_output":
+      return "writing answer";
+    case "google_search_call":
+      return "calling google search";
+    case "google_search_result":
+      return "received search results";
+    case "url_context_call":
+      return "fetching URL";
+    case "url_context_result":
+      return "URL contents loaded";
+    case "function_call":
+      return "calling tool";
+    case "function_result":
+      return "tool returned";
+    default:
+      return null;
+  }
 }
 
 export async function runPipeline(
@@ -75,16 +153,23 @@ export async function runPipeline(
 ): Promise<CompileResult> {
   const sport = opts.sport ?? "golf";
 
-  const intentPrompt = `Parse this ${sport} coaching request into a movement intent. Request: "${transcript}". Default activity to ${sport} if unspecified.`;
   emit({
     stage: "intent",
     agent: "IntentParser",
     model: MODEL,
-    query: intentPrompt,
     status: "start",
     message: "Parsing intent",
+    query: transcript,
   });
-  const intent: Intent = await generateJSON(intentPrompt, IntentSchema);
+  const intentRun = await runInteraction({
+    agentName: "IntentParser",
+    system: `You are the IntentParser sub-agent in a multi-agent ${sport} coaching pipeline. Extract a structured movement intent from the user's request. Default activity to ${sport} if unspecified. Be conservative on durationMinutes (cap at 60).`,
+    input: `Parse this request: "${transcript}"`,
+    thinking: "low",
+    schema: IntentSchema,
+    onEvent: bridge(emit, "intent", "IntentParser"),
+  });
+  const intent: Intent = intentRun.parsed!;
   emit({
     stage: "intent",
     agent: "IntentParser",
@@ -93,36 +178,52 @@ export async function runPipeline(
     data: intent,
   });
 
-  const researchPrompt = `Find 2 to 3 safe, high quality ${sport} drills that target: ${intent.goal}. Skill: ${intent.skillLevel}. Equipment: ${intent.equipment.join(", ") || "none"}. Constraints: ${intent.constraints.join(", ") || "none"}. Provide concrete cues.`;
   emit({
     stage: "researcher",
     agent: "Researcher",
     model: MODEL,
-    query: researchPrompt,
     status: "start",
     message: "Searching drills with Google grounding",
+    query: intent.goal,
   });
-  const research = await generateGrounded(researchPrompt);
+  const researchRun = await runInteraction({
+    agentName: "Researcher",
+    system: `You are the Researcher sub-agent. Use Google search to find 2-3 safe, biomechanically sound ${sport} drills targeting the user's goal. Cite sources by URL. Output a concise paragraph the Compositor can use.`,
+    input: `Goal: ${intent.goal}. Skill: ${intent.skillLevel}. Equipment: ${intent.equipment.join(", ") || "none"}. Constraints: ${intent.constraints.join(", ") || "none"}. Find specific, named drills with cues.`,
+    thinking: "medium",
+    tools: [{ type: "google_search" }],
+    onEvent: bridge(emit, "researcher", "Researcher"),
+  });
   emit({
     stage: "researcher",
     agent: "Researcher",
     status: "result",
-    message: `Found ${research.sources.length} sources`,
-    data: { sources: research.sources, snippet: research.text.slice(0, 280) },
+    message: `Found ${researchRun.sources.length} sources`,
+    data: {
+      sources: researchRun.sources,
+      snippet: researchRun.outputText.slice(0, 280),
+    },
   });
 
   let youtubeNotes = "";
   if (opts.youtubeUrl) {
-    const ytPrompt = `Extract setup steps, key verbal cues, and corrective adaptations from this ${sport} video. Return as a short structured list.`;
     emit({
       stage: "youtube",
       agent: "VideoIngest",
       model: MODEL,
-      query: `${opts.youtubeUrl} :: ${ytPrompt}`,
       status: "start",
-      message: `Ingesting reference video`,
+      message: "Ingesting reference video",
+      query: opts.youtubeUrl,
     });
-    youtubeNotes = await analyzeYouTube(opts.youtubeUrl, ytPrompt);
+    const ytRun = await runInteraction({
+      agentName: "VideoIngest",
+      system: `You are the VideoIngest sub-agent. Extract structured drill insights from the user's reference YouTube video.`,
+      input: `Watch this ${sport} video and extract setup steps, key verbal cues, and corrective adaptations.`,
+      thinking: "medium",
+      videoUrl: opts.youtubeUrl,
+      onEvent: bridge(emit, "youtube", "VideoIngest"),
+    });
+    youtubeNotes = ytRun.outputText;
     emit({
       stage: "youtube",
       agent: "VideoIngest",
@@ -132,20 +233,22 @@ export async function runPipeline(
     });
   }
 
-  const composePrompt = `Compose a ${intent.durationMinutes}-minute ${sport} routine for the user.
-Intent: ${JSON.stringify(intent)}
-Research notes: ${research.text}
-${youtubeNotes ? `Video extraction: ${youtubeNotes}` : ""}
-Return concrete, ordered steps with reps and short cues a coach can call out.`;
   emit({
     stage: "compositor",
     agent: "Compositor",
     model: MODEL,
-    query: composePrompt.slice(0, 600),
     status: "start",
     message: "Compiling routine",
   });
-  const routine: Routine = await generateJSON(composePrompt, RoutineSchema);
+  const composeRun = await runInteraction({
+    agentName: "Compositor",
+    system: `You are the Compositor sub-agent. Compose an ordered, demonstrable ${sport} routine from intent + research. Short coach-callable cues. Reps/duration realistic. Return JSON matching the schema.`,
+    input: `Intent: ${JSON.stringify(intent)}\nResearch: ${researchRun.outputText}\n${youtubeNotes ? `Video notes: ${youtubeNotes}` : ""}\nCompose a ${intent.durationMinutes}-minute routine.`,
+    thinking: "medium",
+    schema: RoutineSchema,
+    onEvent: bridge(emit, "compositor", "Compositor"),
+  });
+  const routine: Routine = composeRun.parsed!;
   emit({
     stage: "compositor",
     agent: "Compositor",
@@ -154,18 +257,22 @@ Return concrete, ordered steps with reps and short cues a coach can call out.`;
     data: routine,
   });
 
-  const validatePrompt = `You are a strict movement-safety reviewer. Review this ${sport} routine for safety, biomechanical soundness, and clarity. Tighten vague cues, soften unsafe instructions, cap reps if extreme. Return BOTH the validated routine AND a list of diffs (field path, before, after, reason).
-Routine: ${JSON.stringify(routine)}
-Pain flags: ${intent.painFlags.join(", ") || "none"}`;
   emit({
     stage: "validator",
     agent: "Validator",
     model: MODEL,
-    query: validatePrompt.slice(0, 600),
     status: "start",
     message: "Scientific safety review",
   });
-  const validation = await generateJSON(validatePrompt, ValidatorSchema);
+  const validateRun = await runInteraction({
+    agentName: "Validator",
+    system: `You are the Validator sub-agent — a strict ${sport} movement-safety reviewer. Tighten vague cues, soften unsafe instructions, cap extreme reps. Return both the validated routine and a list of diffs (field, before, after, reason).`,
+    input: `Routine: ${JSON.stringify(routine)}\nPain flags: ${intent.painFlags.join(", ") || "none"}`,
+    thinking: "high",
+    schema: ValidatorSchema,
+    onEvent: bridge(emit, "validator", "Validator"),
+  });
+  const validation = validateRun.parsed!;
   emit({
     stage: "validator",
     agent: "Validator",
@@ -179,29 +286,35 @@ Pain flags: ${intent.painFlags.join(", ") || "none"}`;
     agent: "VideoScout",
     model: MODEL,
     status: "start",
-    message: "Finding YouTube demos per drill",
+    message: "Finding YouTube demos per drill (parallel sub-agents)",
   });
   const videos: DrillVideo[] = [];
   await Promise.all(
     validation.validated.steps.map(async (step, idx) => {
-      const q = `site:youtube.com best ${sport} tutorial that demonstrates: "${step.title}". Cue: ${step.cue}. Goal: ${intent.goal}. Return the full youtube.com/watch?v=... URL in your answer.`;
+      const agentName = `VideoScout #${idx + 1}`;
       emit({
         stage: "videos",
-        agent: `VideoScout #${idx + 1}`,
+        agent: agentName,
         model: MODEL,
-        query: q,
         status: "thinking",
-        message: `Step ${idx + 1}: searching "${step.title}"`,
+        message: `Searching: "${step.title}"`,
+        query: step.title,
       });
       try {
-        const r = await generateGrounded(q);
-        const all = [...r.sources, ...extractUrlsFromText(r.text)];
-        const yt = all.find((u) => extractVideoId(u));
-        if (yt) {
-          const id = extractVideoId(yt)!;
+        const pick = await runInteraction({
+          agentName,
+          system: `You are a VideoScout sub-agent. Find ONE high-quality YouTube tutorial that visually demonstrates the given ${sport} drill. Use google search restricted to youtube.com. Return strict JSON {url, reason}.`,
+          input: `Drill: "${step.title}". Cue: ${step.cue}. Find best youtube.com/watch?v=... URL.`,
+          thinking: "low",
+          tools: [{ type: "google_search" }],
+          schema: VideoPickSchema,
+          onEvent: bridge(emit, "videos", agentName),
+        });
+        const id = extractVideoId(pick.parsed!.url);
+        if (id) {
           const v: DrillVideo = {
             stepIndex: idx,
-            query: q,
+            query: step.title,
             videoId: id,
             url: `https://www.youtube.com/watch?v=${id}`,
             thumb: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
@@ -209,7 +322,7 @@ Pain flags: ${intent.painFlags.join(", ") || "none"}`;
           videos.push(v);
           emit({
             stage: "videos",
-            agent: `VideoScout #${idx + 1}`,
+            agent: agentName,
             status: "result",
             message: `Picked video for step ${idx + 1}`,
             data: v,
@@ -217,17 +330,17 @@ Pain flags: ${intent.painFlags.join(", ") || "none"}`;
         } else {
           emit({
             stage: "videos",
-            agent: `VideoScout #${idx + 1}`,
-            status: "result",
-            message: `No video found for step ${idx + 1}`,
+            agent: agentName,
+            status: "error",
+            message: `No valid YouTube URL for step ${idx + 1}`,
           });
         }
       } catch (err) {
         emit({
           stage: "videos",
-          agent: `VideoScout #${idx + 1}`,
+          agent: agentName,
           status: "error",
-          message: `Video search failed: ${err instanceof Error ? err.message : String(err)}`,
+          message: `Failed: ${err instanceof Error ? err.message : String(err)}`,
         });
       }
     }),
@@ -241,40 +354,39 @@ Pain flags: ${intent.painFlags.join(", ") || "none"}`;
     data: videos,
   });
 
-  const MomentsSchema = z.object({
-    moments: z
-      .array(
-        z.object({
-          t: z.number().describe("timestamp in seconds"),
-          caption: z.string(),
-        }),
-      )
-      .min(1)
-      .max(4),
-  });
   await Promise.all(
     videos.map(async (v) => {
       const step = validation.validated.steps[v.stepIndex];
-      const q = `Watch this ${sport} drill video and pick 2-4 key moments that visually demonstrate the cue "${step?.cue ?? ""}" for the drill "${step?.title ?? ""}". For each moment return a timestamp in seconds (integer) and a one-line caption describing what the user should see. Avoid intro/outro/talking-head segments. Return JSON.`;
+      const agentName = `MomentMiner #${v.stepIndex + 1}`;
       emit({
         stage: "videos",
-        agent: `MomentMiner #${v.stepIndex + 1}`,
+        agent: agentName,
         model: MODEL,
-        query: q,
         status: "thinking",
-        message: `Mining key moments from step ${v.stepIndex + 1} video`,
+        message: `Mining key moments from step ${v.stepIndex + 1}`,
+        query: step?.title,
       });
       try {
-        const parsed = await analyzeYouTubeJSON(v.url, q, MomentsSchema);
-        v.moments = parsed.moments.map((m, mi): DrillMoment => ({
-          t: Math.max(0, Math.floor(m.t)),
-          caption: m.caption,
-          thumb: `https://i.ytimg.com/vi/${v.videoId}/${(mi % 3) + 1}.jpg`,
-        }));
+        const r = await runInteraction({
+          agentName,
+          system: `You are the MomentMiner sub-agent. Watch a ${sport} drill video and pick 2-4 visually distinct key moments matching the drill cue. Each moment has a second-precise timestamp and a one-line caption. Skip talking-head and intro/outro frames.`,
+          input: `Drill: "${step?.title ?? ""}". Cue: ${step?.cue ?? ""}. Pick moments.`,
+          thinking: "medium",
+          videoUrl: v.url,
+          schema: MomentsSchema,
+          onEvent: bridge(emit, "videos", agentName),
+        });
+        v.moments = r.parsed!.moments.map(
+          (m, mi): DrillMoment => ({
+            t: Math.max(0, Math.floor(m.t)),
+            caption: m.caption,
+            thumb: `https://i.ytimg.com/vi/${v.videoId}/${(mi % 3) + 1}.jpg`,
+          }),
+        );
         v.start = v.moments[0]?.t;
         emit({
           stage: "videos",
-          agent: `MomentMiner #${v.stepIndex + 1}`,
+          agent: agentName,
           status: "result",
           message: `${v.moments.length} moments for step ${v.stepIndex + 1}`,
           data: v.moments,
@@ -282,7 +394,7 @@ Pain flags: ${intent.painFlags.join(", ") || "none"}`;
       } catch (err) {
         emit({
           stage: "videos",
-          agent: `MomentMiner #${v.stepIndex + 1}`,
+          agent: agentName,
           status: "error",
           message: `Moment mining failed: ${err instanceof Error ? err.message : String(err)}`,
         });
@@ -297,14 +409,9 @@ Pain flags: ${intent.painFlags.join(", ") || "none"}`;
     diffs: validation.diffs as ValidatorDiff[],
     videos,
     youtubeUrl: opts.youtubeUrl,
-    sources: research.sources,
+    sources: researchRun.sources,
   };
 
   emit({ stage: "done", status: "result", message: "Compiled", data: result });
   return result;
-}
-
-function extractUrlsFromText(text: string): string[] {
-  const re = /https?:\/\/[^\s)\]"']+/g;
-  return text.match(re) ?? [];
 }
